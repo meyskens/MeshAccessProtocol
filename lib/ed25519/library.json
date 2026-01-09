@@ -1,0 +1,10 @@
+{
+    "name": "ed25519",
+    "version": "1.0.0",
+    "description": "Ed25519 digital signature algorithm",
+    "keywords": ["crypto", "ed25519", "signature"],
+    "build": {
+        "srcFilter": ["+<*.c>"],
+        "flags": ["-w"]
+    }
+}
