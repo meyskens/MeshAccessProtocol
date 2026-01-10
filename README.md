@@ -72,6 +72,10 @@ There are a few options:
 
 - **UC Browser 7.7** [JAR](./jar/UCBrowser.jar) - requires going to settings and disable `WAP Access via Server` to use direct WAP. Company and all servers are dead, all checks will fail, MAP blocks them anyway.
 
+### What websites to visit?
+
+We are working at [Bevelgacom](https://github.com/bevelgacom/) to create lots of WML content compatible with the earliest WAP devices and building the mordern WAP portal! Check it out on [http://wap.bevelgacom.be/](http://wap.bevelgacom.be/) (works with MAP too!).
+
 ### Prerequisites
 
 - [PlatformIO](https://platformio.org/)
