@@ -140,6 +140,9 @@ static uint16_t ap_currentRequestPort = 0;
 // Flag to track if a request is currently being processed via mesh
 static bool ap_requestInProgress = false;
 
+// Next part number to stream for ordered non-WMLC streaming (starts at 2, part 1 has headers)
+static uint8_t ap_nextPartToStream = 2;
+
 // Generate random source port (1024-9999)
 static uint16_t ap_generateSourcePort() {
   return 1024 + (esp_random() % (9999 - 1024 + 1));
@@ -455,6 +458,7 @@ bool sendWAPRequestViaMesh(const uint8_t* request, size_t requestLen,
   ap_headersSent = false;
   ap_isWMLC = false;
   ap_bodyBytesReceived = 0;
+  ap_nextPartToStream = 2;  // Reset ordered streaming state (part 1 has headers)
   memset(&ap_earlyResponse, 0, sizeof(ap_earlyResponse));
   
   // Generate random source port for this request (used for response routing)
@@ -1050,13 +1054,17 @@ void ap_handleIncomingMesh(const String& from, const uint8_t* data, size_t len) 
             ap_trySendEarlyHeaders(&data[12], partPayloadLen);
           }
         } else if (!ap_isWMLC && ap_headersSent && ap_waitingClient && ap_waitingClient->connected()) {
-          // For non-WMLC responses, stream body data as it arrives
-          // Skip the WSP header bytes (they're in the first packet)
-          if (currentPart > 1) {
-            ap_waitingClient->write(&data[12], partPayloadLen);
+          // For non-WMLC responses, stream body data in ORDER as parts arrive
+          // Only stream if this is the next expected part, then catch up on buffered parts
+          while (ap_nextPartToStream <= concat->totalParts && 
+                 concat->partReceived[ap_nextPartToStream - 1]) {
+            size_t streamOffset = (ap_nextPartToStream - 1) * (MESHCORE_MAX_BINARY_PAYLOAD - 12);
+            size_t streamLen = concat->partSizes[ap_nextPartToStream - 1];
+            ap_waitingClient->write(&concat->data[streamOffset], streamLen);
             ap_waitingClient->flush();
-            ap_bodyBytesReceived += partPayloadLen;
-            Serial.printf("AP-WDP: Streamed %zu body bytes (part %d)\n", partPayloadLen, currentPart);
+            ap_bodyBytesReceived += streamLen;
+            Serial.printf("AP-WDP: Streamed %zu body bytes (part %d)\n", streamLen, ap_nextPartToStream);
+            ap_nextPartToStream++;
           }
         }
       }
