@@ -289,7 +289,7 @@ protected:
   }
 
   bool allowPacketForward(const mesh::Packet* packet) override {
-    return true;
+    return false;
   }
 
   void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
