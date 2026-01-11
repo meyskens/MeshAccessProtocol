@@ -249,11 +249,33 @@ size_t WAPRequest::createAcceptAllHeaders(uint8_t* outBuffer, size_t outBufferSi
         pos += createAcceptHeader(WSP_CT_APP_VND_WAP_WMLSCRIPTC, &outBuffer[pos], outBufferSize - pos);
     }
     
+    // text/plain (0x03)
+    if (pos + 2 <= outBufferSize) {
+        pos += createAcceptHeader(WSP_CT_TEXT_PLAIN, &outBuffer[pos], outBufferSize - pos);
+    }
+
+    // i'd love to have used image/* but Kannel says no
+
     // image/vnd.wap.wbmp (0x21)
     if (pos + 2 <= outBufferSize) {
         pos += createAcceptHeader(WSP_CT_IMAGE_VND_WAP_WBMP, &outBuffer[pos], outBufferSize - pos);
     }
-    
+
+    // image/png (0x20)
+    if (pos + 2 <= outBufferSize) {
+        pos += createAcceptHeader(WSP_CT_IMAGE_PNG, &outBuffer[pos], outBufferSize - pos);
+    }
+
+    // image/gif (0x1D)
+    if (pos + 2 <= outBufferSize) {
+        pos += createAcceptHeader(WSP_CT_IMAGE_GIF, &outBuffer[pos], outBufferSize - pos);
+    }
+
+    // image/jpeg (0x1E)
+    if (pos + 2 <= outBufferSize) {
+        pos += createAcceptHeader(WSP_CT_IMAGE_JPEG, &outBuffer[pos], outBufferSize - pos);
+    }
+
     // text/plain (0x03)
     if (pos + 2 <= outBufferSize) {
         pos += createAcceptHeader(WSP_CT_TEXT_PLAIN, &outBuffer[pos], outBufferSize - pos);
