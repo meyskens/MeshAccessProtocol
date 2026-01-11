@@ -22,7 +22,10 @@ Why reinvent the wheel for internet over mesh when somebody already did the hard
 
 [![Demo of WAP browsing over MeshCore](https://cdn.blahaj.social/media_attachments/files/115/867/457/642/397/936/original/23d46f1aa937079e.jpeg)](https://blahaj.social/@maartje/115867225088740197)
 
-https://github.com/meyskens/MeshAccessProtocol/raw/refs/heads/main/assets/demo.mp4
+
+
+https://github.com/user-attachments/assets/c09a46a8-315f-404d-86dd-42585a34f48f
+
 
 ## Overview
 
