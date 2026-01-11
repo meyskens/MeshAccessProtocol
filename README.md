@@ -63,7 +63,7 @@ There are a few options:
 - Nokia 6300i (not the classic 6300!) with WiFi and built-in WAP browser (to be tested, probably a rare unicorn in phones)
 - Smartphone with J2ME emulator and WAP browser app (more below), they are noisy in requests! I tried to block most of them.
 - Symbian phone with WiFi (like Nokia E65) and a J2ME WAP browser (older Symbian might have a built-in WML capable browser)
-- Laptop with WAP emulator
+- Laptop with [WAP emulator](https://github.com/bevelgacom/wap.bevelgacom.be/?tab=readme-ov-file#emulators)
 - Why not contribute to our efforts on a modern WAP browser? (contact me on Mastodon) (did anyone say 3310 LoRa mod?)
 - Any phone running MediaTek MAUI Mocor RTOS (HMD sells it as S30+) that might have WiFi. It has a full WML browser hidden, even if not available it can be triggered with a WAP Push message. (report if you find one!)
 
