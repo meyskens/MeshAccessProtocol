@@ -6,6 +6,13 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <functional>
+#include <time.h>
+
+// NTP Configuration
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.nist.gov"
+#define NTP_SERVER_3 "time.google.com"
+#define NTP_TIMEOUT_MS 10000  // 10 second timeout for NTP sync
 
 // Default values if not defined in main
 #ifndef MESHCORE_MAX_BINARY_PAYLOAD
@@ -530,6 +537,9 @@ void proxy_handleIncomingMesh(const String& from, const uint8_t* data, size_t le
   }
 }
 
+// Forward declaration for NTP sync (defined below)
+bool proxy_syncTimeFromNTP();
+
 void proxy_connectToWiFi(const char* ssid, const char* password) {
   Serial.println("DEBUG: Starting WiFi connection (Proxy Mode)...");
   displayStatus("WiFi [Proxy]", "Connecting to:", ssid, nullptr);
@@ -569,7 +579,10 @@ void proxy_connectToWiFi(const char* ssid, const char* password) {
     char ipLine[32];
     snprintf(ipLine, sizeof(ipLine), "IP: %s", WiFi.localIP().toString().c_str());
     displayStatus("WiFi Connected!", ssid, ipLine, nullptr);
-    delay(2000);  // Show success for 2 seconds
+    delay(1000);  // Show success briefly
+    
+    // Sync time from NTP after WiFi connects
+    proxy_syncTimeFromNTP();
   } else {
     Serial.println("DEBUG: WiFi connection FAILED!");
     displayStatus("WiFi FAILED!", "Could not connect", ssid, "Continuing...");
@@ -579,6 +592,83 @@ void proxy_connectToWiFi(const char* ssid, const char* password) {
 
 bool proxy_isWiFiConnected() {
   return WiFi.status() == WL_CONNECTED;
+}
+
+// Callback for setting RTC time (set from main.cpp)
+static std::function<void(uint32_t)> setRTCTimeCallback = nullptr;
+
+void proxy_setRTCCallback(std::function<void(uint32_t)> callback) {
+  setRTCTimeCallback = callback;
+}
+
+// Synchronize time from NTP servers and set the RTC
+bool proxy_syncTimeFromNTP() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("NTP: WiFi not connected, skipping time sync");
+    return false;
+  }
+  
+  Serial.println("NTP: Starting time synchronization...");
+  displayStatus("NTP Sync", "Connecting to", "time servers...", nullptr);
+  
+  // Configure NTP with UTC timezone (offset 0)
+  // The RTC stores UTC time, timezone conversion happens at display time if needed
+  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+  
+  // Wait for NTP to actually update the time (not just return any time)
+  // We need to wait until time() returns something > Jan 1, 2025
+  unsigned long startAttempt = millis();
+  time_t now;
+  const time_t MIN_VALID_TIME = 1735689600;  // Jan 1, 2026
+  
+  while (true) {
+    now = time(nullptr);
+    if (now >= MIN_VALID_TIME) {
+      break;  // Got valid time from NTP
+    }
+    
+    if (millis() - startAttempt > NTP_TIMEOUT_MS) {
+      Serial.printf("NTP: Timeout waiting for time sync (last: %lu)\n", (unsigned long)now);
+      displayStatus("NTP Sync", "FAILED!", "Timeout", "Continuing...");
+      delay(1500);
+      return false;
+    }
+    
+    // Update display with progress
+    int elapsed = (millis() - startAttempt) / 1000;
+    char progressLine[32];
+    snprintf(progressLine, sizeof(progressLine), "Waiting... %ds", elapsed);
+    displayStatus("NTP Sync", "Getting time", progressLine, nullptr);
+    
+    Serial.printf("NTP: Waiting for valid time... (current: %lu)\n", (unsigned long)now);
+    delay(500);  // Small delay between checks
+  }
+  
+  // Get time info for display
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+  
+  // Format time for display
+  char timeStr[32];
+  char dateStr[32];
+  strftime(timeStr, sizeof(timeStr), "%H:%M:%S UTC", &timeinfo);
+  strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
+  
+  Serial.printf("NTP: Time synchronized: %s %s\n", dateStr, timeStr);
+  Serial.printf("NTP: Unix timestamp: %lu\n", (unsigned long)now);
+  
+  // Set the RTC using callback if available
+  if (setRTCTimeCallback) {
+    setRTCTimeCallback((uint32_t)now);
+    Serial.println("NTP: RTC clock updated");
+  } else {
+    Serial.println("NTP: WARNING - No RTC callback set, time not persisted to RTC");
+  }
+  
+  displayStatus("NTP Sync OK!", dateStr, timeStr, nullptr);
+  delay(2000);  // Show success for 2 seconds
+  
+  return true;
 }
 
 #endif // ESP32

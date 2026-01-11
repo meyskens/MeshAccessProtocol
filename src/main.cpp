@@ -592,6 +592,39 @@ protected:
       return;
     }
     
+  #if (OPERATION_MODE == MODE_AP)
+    // Check for "ping ok" response from proxy node (AP mode only)
+    if (textLen == 7 && memcmp(text, "ping ok", 7) == 0) {
+      Serial.printf("   Ping OK received from %s! sender_timestamp=%lu\n", from.name, (unsigned long)sender_timestamp);
+      
+      // Verify this is from the proxy node we're expecting
+      ContactInfo* proxy = getProxyContact();
+      if (proxy && memcmp(from.id.pub_key, proxy->id.pub_key, PUB_KEY_SIZE) == 0) {
+        // Sync RTC from proxy's timestamp (proxy has NTP-synced time)
+        if (sender_timestamp > 0) {
+          uint32_t currentTime = getRTCClock()->getCurrentTime();
+          if (sender_timestamp > currentTime || currentTime < 1735689600) {  // Jan 1, 2026 sanity check
+            getRTCClock()->setCurrentTime(sender_timestamp);
+            Serial.printf("   RTC synced from proxy: %lu -> %lu\n", (unsigned long)currentTime, (unsigned long)sender_timestamp);
+          } else {
+            Serial.printf("   RTC already set (current: %lu, proxy: %lu)\n", (unsigned long)currentTime, (unsigned long)sender_timestamp);
+          }
+        }
+        
+        // Mark proxy path as discovered (use path from incoming packet via 'from')
+       // Serial.printf("   Proxy path confirmed! path_len=%d\n", from.out_path_len);
+       // ap_setProxyPathDiscovered(from.out_path_len);
+       // proxy_ping_pending = false;
+        
+        messages_handled++;
+        updateDisplay();
+        return;
+      } else {
+        Serial.println("   WARNING: ping ok received from non-proxy node, ignoring");
+      }
+    }
+  #endif
+    
     // Check if this looks like Base91-encoded WDP data
     if (textLen > 0) {
       // Queue the message for Base91 decoding and processing
@@ -1143,8 +1176,9 @@ public:
       scanRecentContacts(n, this);
     } else if (strcmp(command, "clock") == 0) {    // show current time
       uint32_t now = getRTCClock()->getCurrentTime();
+      Serial.printf("   Raw timestamp: %lu\n", (unsigned long)now);
       DateTime dt = DateTime(now);
-      Serial.printf(   "%02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+      Serial.printf("   %02d:%02d - %d/%d/%d UTC\n", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
     } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
       uint32_t secs = _atoi(&command[5]);
       setClock(secs);
@@ -1651,6 +1685,11 @@ void checkUserButton() {
 void initWiFiMode() {
   #if (OPERATION_MODE == MODE_PROXY)
     Serial.println("DEBUG: Operation Mode = PROXY");
+    // Set RTC callback before WiFi connection (NTP sync needs it)
+    proxy_setRTCCallback([](uint32_t timestamp) {
+      rtc_clock.setCurrentTime(timestamp);
+      Serial.printf("RTC: Clock set to %lu via NTP\n", (unsigned long)timestamp);
+    });
     proxy_connectToWiFi(WIFI_SSID, WIFI_PASSWORD);
   #elif (OPERATION_MODE == MODE_AP)
     Serial.println("DEBUG: Operation Mode = AP");
@@ -1701,11 +1740,6 @@ void setup() {
   // Wait for USB CDC serial to be ready (ESP32-S3 native USB)
   delay(2000);
   
-  // Initialize WiFi based on operation mode
-#ifdef ESP32
-  initWiFiMode();
-#endif
-  
   displayStatus("MeshAccessProtocol", "Initializing...");
 
   Serial.println("DEBUG: Calling board.begin()...");
@@ -1721,6 +1755,11 @@ void setup() {
     halt(); 
   }
   Serial.println("DEBUG: radio_init() done");
+
+  // Initialize WiFi AFTER radio_init() so NTP sync doesn't get overwritten by rtc_clock.begin()
+#ifdef ESP32
+  initWiFiMode();
+#endif
 
   displayStatus("MeshAccessProtocol", "Radio OK", "Seeding RNG...");
 
