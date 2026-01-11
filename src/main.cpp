@@ -35,7 +35,7 @@
   #define MODE_AP    2
   
   #ifndef OPERATION_MODE
-    #define OPERATION_MODE MODE_AP
+    #define OPERATION_MODE MODE_PROXY
   #endif
   
   #include "mode_proxy.h"
@@ -154,11 +154,24 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   }
 
   static const int MAX_PENDING_REPLIES = 16;
+  static const int PING_REPLY_MAX_RETRIES = 5;
+  static const unsigned long PING_REPLY_TIMEOUT_MS = 8000;  // 8 second timeout per attempt
+
+  // Constants for normal send retries
+  static const int MAX_PENDING_OUTBOX = 16;
+  static const int NORMAL_SEND_MAX_RETRIES = 4;
+  static const unsigned long NORMAL_SEND_TIMEOUT_MS = 8000;  // 8 second timeout per attempt (allows for slow LoRa round trip)
+  static const unsigned long NORMAL_SEND_RETRY_DELAY_MS = 1000;  // 1 second delay between retries on failure
   struct PendingReply {
     bool active;
     unsigned long time;
     uint8_t senderPubKey[PUB_KEY_SIZE];
     char replyText[256];
+    uint8_t retryCount;       // Current retry attempt (0 = first send)
+    uint8_t maxRetries;       // Max retries (0 = no retries, just send once)
+    bool needsPathReset;      // If true, reset path to sender before sending (flood route)
+    bool waitingForAck;       // If true, waiting for ACK before retry timeout
+    uint32_t expectedAckCrc;  // Expected ACK CRC for this reply
   };
   PendingReply pending_replies[MAX_PENDING_REPLIES];
 
@@ -168,6 +181,36 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     msg->time = 0;
     memset(msg->senderPubKey, 0, sizeof(msg->senderPubKey));
     memset(msg->replyText, 0, sizeof(msg->replyText));
+    msg->retryCount = 0;
+    msg->maxRetries = 0;
+    msg->needsPathReset = false;
+    msg->waitingForAck = false;
+    msg->expectedAckCrc = 0;
+  }
+
+  // Pending outbox for normal sends with retry logic
+  struct PendingOutbox {
+    bool active;
+    unsigned long time;
+    uint8_t recipientPubKey[PUB_KEY_SIZE];
+    uint8_t wdpData[256];       // Binary WDP data (before Base91 encoding)
+    size_t wdpLen;
+    uint8_t retryCount;         // Current retry attempt (0 = first send)
+    bool waitingForAck;         // If true, waiting for ACK before retry timeout
+    uint32_t expectedAckCrc;    // Expected ACK CRC for this message
+  };
+  PendingOutbox pending_outbox[MAX_PENDING_OUTBOX];
+
+  // Clear/reset a pending outbox slot
+  void clearPendingOutbox(PendingOutbox* msg) {
+    msg->active = false;
+    msg->time = 0;
+    memset(msg->recipientPubKey, 0, sizeof(msg->recipientPubKey));
+    memset(msg->wdpData, 0, sizeof(msg->wdpData));
+    msg->wdpLen = 0;
+    msg->retryCount = 0;
+    msg->waitingForAck = false;
+    msg->expectedAckCrc = 0;
   }
 
   // Message counter for display
@@ -308,6 +351,46 @@ protected:
   }
 
   ContactInfo* processAck(const uint8_t *data) override {
+    uint32_t received_crc;
+    memcpy(&received_crc, data, 4);
+    
+#ifdef ESP32
+    // Check against all pending outbox items FIRST (before global expected_ack_crc)
+    // This is important because sendMessage sets expected_ack_crc, and we copy it to outbox
+    for (int i = 0; i < MAX_PENDING_OUTBOX; i++) {
+      if (pending_outbox[i].active && pending_outbox[i].waitingForAck) {
+        if (pending_outbox[i].expectedAckCrc == received_crc) {
+          Serial.printf("   Got ACK for Outbox #%d! (round trip: %d millis)\n", i, _ms->getMillis() - last_msg_sent);
+          clearPendingOutbox(&pending_outbox[i]);
+          expected_ack_crc = 0;  // Also clear global to prevent double-handling
+          return NULL;
+        }
+      }
+    }
+    
+    // Check against all pending reply items
+    for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
+      if (pending_replies[i].active && pending_replies[i].waitingForAck) {
+        if (pending_replies[i].expectedAckCrc == received_crc) {
+          Serial.printf("   Got ACK for Reply #%d!\n", i);
+          clearPendingReply(&pending_replies[i]);
+          expected_ack_crc = 0;  // Also clear global to prevent double-handling
+          return NULL;
+        }
+      }
+    }
+    
+  #if (OPERATION_MODE == MODE_AP)
+    // Check proxy ping ACK (dedicated tracking to avoid collision with outbox)
+    if (proxy_ping_pending && proxy_ping_expected_ack_crc == received_crc) {
+      Serial.printf("   Got ACK for Proxy Ping! (round trip: %d millis)\n", _ms->getMillis() - proxy_ping_sent_time);
+      proxy_ping_expected_ack_crc = 0;  // Clear to signal ACK received
+      return NULL;
+    }
+  #endif
+#endif
+    
+    // Fallback: check the standard expected_ack_crc (for non-queued sends like terminal commands)
     if (memcmp(data, &expected_ack_crc, 4) == 0) {     // got an ACK from recipient
       Serial.printf("   Got ACK! (round trip: %d millis)\n", _ms->getMillis() - last_msg_sent);
       // NOTE: the same ACK can be received multiple times!
@@ -315,9 +398,7 @@ protected:
       return NULL;  // TODO: really should return ContactInfo pointer 
     }
 
-    //uint32_t crc;
-    //memcpy(&crc, data, 4);
-    //MESH_DEBUG_PRINTLN("unknown ACK received: %08X (expected: %08X)", crc, expected_ack_crc);
+    //MESH_DEBUG_PRINTLN("unknown ACK received: %08X (expected: %08X)", received_crc, expected_ack_crc);
     return NULL;
   }
 
@@ -480,16 +561,29 @@ protected:
       char senderIdStr[16];
       snprintf(senderIdStr, sizeof(senderIdStr), "%02x%02x%02x%02x", 
                from.id.pub_key[0], from.id.pub_key[1], from.id.pub_key[2], from.id.pub_key[3]);
-      Serial.printf("   Ping received from %s, queuing reply\n", senderIdStr);
+      Serial.printf("   Ping received from %s, queuing reply with flood routing\n", senderIdStr);
       
-      // Queue ping reply for sending after ACK
+      // Reset path to sender to force flood routing for ping OK response
+      ContactInfo* sender = lookupContactByPubKey(from.id.pub_key, PUB_KEY_SIZE);
+      if (sender) {
+        resetPathTo(*sender);
+        saveContacts();
+        Serial.printf("   Reset path to %s for flood routing\n", sender->name);
+      }
+      
+      // Queue ping reply for sending after ACK with retry logic
       for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
         if (!pending_replies[i].active) {
           pending_replies[i].active = true;
           pending_replies[i].time = _ms->getMillis();
           memcpy(pending_replies[i].senderPubKey, from.id.pub_key, PUB_KEY_SIZE);
           snprintf(pending_replies[i].replyText, sizeof(pending_replies[i].replyText), "ping ok");
-          Serial.printf("   (queued ping reply #%d for sending after ACK)\n", i);
+          pending_replies[i].retryCount = 0;
+          pending_replies[i].maxRetries = PING_REPLY_MAX_RETRIES;
+          pending_replies[i].needsPathReset = true;  // Reset path before each send (flood)
+          pending_replies[i].waitingForAck = false;
+          pending_replies[i].expectedAckCrc = 0;
+          Serial.printf("   (queued ping reply #%d with %d retries, flood routing)\n", i, PING_REPLY_MAX_RETRIES);
           break;
         }
       }
@@ -597,6 +691,10 @@ public:
     for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
       pending_replies[i].active = false;
     }
+    // Initialize pending outbox queue
+    for (int i = 0; i < MAX_PENDING_OUTBOX; i++) {
+      pending_outbox[i].active = false;
+    }
     messages_handled = 0;
   }
 
@@ -610,6 +708,7 @@ public:
   // On startup the AP will ping the proxy node to discover a path
   bool proxy_ping_pending = false;
   unsigned long proxy_ping_sent_time = 0;
+  uint32_t proxy_ping_expected_ack_crc = 0;  // Dedicated ACK tracking (avoids collision with global)
   static const unsigned long PROXY_PING_TIMEOUT_MS = 8000;  // 8 second timeout per attempt
 
   // Get proxy contact by public key
@@ -646,12 +745,14 @@ public:
     }
     
     uint32_t est_timeout;
-    int result = sendMessage(*proxy, getRTCClock()->getCurrentTime(), 0, "ping", expected_ack_crc, est_timeout);
+    uint32_t ack_crc;  // Local variable for sendMessage output
+    int result = sendMessage(*proxy, getRTCClock()->getCurrentTime(), 0, "ping", ack_crc, est_timeout);
     if (result == MSG_SEND_FAILED) {
       Serial.println("AP-Discovery: Ping send failed");
       return false;
     }
     
+    proxy_ping_expected_ack_crc = ack_crc;  // Store in dedicated field
     proxy_ping_sent_time = _ms->getMillis();
     proxy_ping_pending = true;
     Serial.printf("AP-Discovery: Ping sent via %s\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
@@ -671,8 +772,8 @@ public:
 
   // Called when we receive an ACK - check if it's from proxy
   void checkProxyPingAck() {
-    if (proxy_ping_pending && expected_ack_crc == 0) {
-      // ACK was received (expected_ack_crc is cleared in processAck)
+    if (proxy_ping_pending && proxy_ping_expected_ack_crc == 0) {
+      // ACK was received (proxy_ping_expected_ack_crc is cleared in processAck)
       proxy_ping_pending = false;
       
       // Get updated path length
@@ -770,8 +871,9 @@ public:
   // NOTE: MeshCore sendMessage uses strlen() and WDP contains a lot of 0x00
   // so we must Base91-encode binary data to avoid null bytes truncating the message!
   // Base91 uses all ASCII characters not causing issues, much more efficient than hex or base64.
+  // Messages are queued and retried up to 4 times until ACK is received.
   void sendWDPToMesh(const String& recipientId, const uint8_t* data, size_t len) {
-    Serial.printf("WDP->Mesh: Sending %d bytes to %s\n", len, recipientId.c_str());
+    Serial.printf("WDP->Mesh: Queueing %d bytes to %s (with %d retries)\n", len, recipientId.c_str(), NORMAL_SEND_MAX_RETRIES);
     
     // Find contact by pub_key prefix
     uint8_t targetPrefix[4];
@@ -792,12 +894,38 @@ public:
       len = maxBinaryLen;
     }
     
+    // Queue message for sending with retry logic
+    for (int i = 0; i < MAX_PENDING_OUTBOX; i++) {
+      if (!pending_outbox[i].active) {
+        pending_outbox[i].active = true;
+        pending_outbox[i].time = _ms->getMillis();
+        memcpy(pending_outbox[i].recipientPubKey, contact->id.pub_key, PUB_KEY_SIZE);
+        memcpy(pending_outbox[i].wdpData, data, len);
+        pending_outbox[i].wdpLen = len;
+        pending_outbox[i].retryCount = 0;
+        pending_outbox[i].waitingForAck = false;
+        pending_outbox[i].expectedAckCrc = 0;
+        Serial.printf("WDP->Mesh: Queued message #%d (%d bytes)\n", i, len);
+        return;
+      }
+    }
+    Serial.println("WDP->Mesh: ERROR - Outbox full, dropping message");
+  }
+
+  // Internal function to actually send a queued WDP message
+  bool sendQueuedWDPMessage(PendingOutbox* msg) {
+    ContactInfo* contact = lookupContactByPubKey(msg->recipientPubKey, PUB_KEY_SIZE);
+    if (!contact) {
+      Serial.println("WDP->Mesh: Contact not found for queued message");
+      return false;
+    }
+    
     // Base91-encode
     char encodedMsg[MESHCORE_MAX_BYTES + 1];
-    size_t encodedLen = Base91::encode(data, len, encodedMsg, sizeof(encodedMsg));
+    size_t encodedLen = Base91::encode(msg->wdpData, msg->wdpLen, encodedMsg, sizeof(encodedMsg));
     if (encodedLen == 0) {
       Serial.println("WDP->Mesh: Base91 encoding failed");
-      return;
+      return false;
     }
     
     // Send as regular message
@@ -805,11 +933,18 @@ public:
     int result = sendMessage(*contact, getRTCClock()->getCurrentTime(), 0, encodedMsg, expected_ack_crc, est_timeout);
     if (result == MSG_SEND_FAILED) {
       Serial.println("WDP->Mesh: Send failed");
-    } else {
-      last_msg_sent = _ms->getMillis();
-      Serial.printf("WDP->Mesh: Sent %s (%d bytes Base91-encoded as %d chars)\n", 
-                    result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT", len, encodedLen);
+      return false;
     }
+    
+    last_msg_sent = _ms->getMillis();
+    msg->waitingForAck = true;
+    msg->expectedAckCrc = expected_ack_crc;
+    msg->time = _ms->getMillis();  // Reset time for timeout tracking
+    Serial.printf("WDP->Mesh: Sent %s (%d bytes Base91-encoded as %d chars, attempt %d/%d)\n", 
+                  result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT", 
+                  msg->wdpLen, encodedLen,
+                  msg->retryCount + 1, NORMAL_SEND_MAX_RETRIES + 1);
+    return true;
   }
 #endif
 
@@ -1270,30 +1405,137 @@ public:
     
     // Process pending replies (after 100ms to allow ACK to be sent first)
     for (int i = 0; i < MAX_PENDING_REPLIES; i++) {
-      if (pending_replies[i].active && (_ms->getMillis() - pending_replies[i].time > 100)) {
-        // Copy data before clearing
-        uint8_t senderPubKey[PUB_KEY_SIZE];
-        char replyText[256];
-        memcpy(senderPubKey, pending_replies[i].senderPubKey, sizeof(senderPubKey));
-        strncpy(replyText, pending_replies[i].replyText, sizeof(replyText));
+      if (!pending_replies[i].active) continue;
+      
+      // Check if waiting for ACK (ACK is handled directly in processAck now)
+      if (pending_replies[i].waitingForAck) {
+        // Check for timeout (8 seconds per attempt)
+        if (_ms->getMillis() - pending_replies[i].time > PING_REPLY_TIMEOUT_MS) {
+          pending_replies[i].waitingForAck = false;
+          pending_replies[i].retryCount++;
+          
+          if (pending_replies[i].retryCount > pending_replies[i].maxRetries) {
+            // No more retries, give up
+            Serial.printf("   Ping reply #%d failed after %d retries\n", i, pending_replies[i].maxRetries);
+            clearPendingReply(&pending_replies[i]);
+            continue;
+          }
+          
+          // Queue retry
+          Serial.printf("   Ping reply #%d timed out, retry %d/%d\n", i, 
+                        pending_replies[i].retryCount, pending_replies[i].maxRetries);
+          pending_replies[i].time = _ms->getMillis();  // Reset time for next attempt
+        }
+        continue;  // Still waiting for ACK or timeout
+      }
+      
+      // Ready to send (after 100ms delay from queue time)
+      if (_ms->getMillis() - pending_replies[i].time > 100) {
+        ContactInfo* sender = lookupContactByPubKey(pending_replies[i].senderPubKey, PUB_KEY_SIZE);
+        if (!sender) {
+          Serial.println("   Reply target contact not found, clearing");
+          clearPendingReply(&pending_replies[i]);
+          continue;
+        }
         
-        // Clear the slot
-        clearPendingReply(&pending_replies[i]);
+        // Reset path if needed (for flood routing on ping OK)
+        if (pending_replies[i].needsPathReset) {
+          resetPathTo(*sender);
+          Serial.printf("   Reset path to %s for flood routing (attempt %d/%d)\n", 
+                        sender->name, pending_replies[i].retryCount + 1, pending_replies[i].maxRetries + 1);
+        }
         
-        Serial.println("   Processing queued welcome reply");
-        
-        ContactInfo* sender = lookupContactByPubKey(senderPubKey, PUB_KEY_SIZE);
-        if (sender) {
+        // If this is a simple reply (no retries), just send and clear
+        if (pending_replies[i].maxRetries == 0) {
           uint32_t est_timeout;
           int result = sendMessage(*sender, getRTCClock()->getCurrentTime(), 0, 
-                                   replyText, expected_ack_crc, est_timeout);
+                                   pending_replies[i].replyText, expected_ack_crc, est_timeout);
           if (result != MSG_SEND_FAILED) {
             last_msg_sent = _ms->getMillis();
-            Serial.printf("   Sent welcome reply (%s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
+            Serial.printf("   Sent reply (%s)\n", result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT");
+          }
+          clearPendingReply(&pending_replies[i]);
+        } else {
+          // Send with retry tracking
+          uint32_t est_timeout;
+          int result = sendMessage(*sender, getRTCClock()->getCurrentTime(), 0, 
+                                   pending_replies[i].replyText, expected_ack_crc, est_timeout);
+          if (result != MSG_SEND_FAILED) {
+            last_msg_sent = _ms->getMillis();
+            pending_replies[i].waitingForAck = true;
+            pending_replies[i].expectedAckCrc = expected_ack_crc;
+            pending_replies[i].time = _ms->getMillis();  // Start timeout from send time
+            Serial.printf("   Sent ping reply via %s (attempt %d/%d, waiting for ACK)\n", 
+                          result == MSG_SEND_SENT_FLOOD ? "FLOOD" : "DIRECT",
+                          pending_replies[i].retryCount + 1, pending_replies[i].maxRetries + 1);
+          } else {
+            // Send failed, retry immediately
+            pending_replies[i].retryCount++;
+            if (pending_replies[i].retryCount > pending_replies[i].maxRetries) {
+              Serial.printf("   Ping reply send failed after %d retries\n", pending_replies[i].maxRetries);
+              clearPendingReply(&pending_replies[i]);
+            } else {
+              Serial.printf("   Ping reply send failed, will retry (%d/%d)\n",
+                            pending_replies[i].retryCount, pending_replies[i].maxRetries);
+              pending_replies[i].time = _ms->getMillis();
+            }
           }
         }
         
         break;  // Only process one per loop iteration
+      }
+    }
+    
+    // Process pending outbox (normal sends with retry logic)
+    // First check if any message is already waiting for ACK - only one in flight at a time
+    bool anyWaitingForAck = false;
+    for (int i = 0; i < MAX_PENDING_OUTBOX; i++) {
+      if (pending_outbox[i].active && pending_outbox[i].waitingForAck) {
+        anyWaitingForAck = true;
+        
+        // Check for timeout (ACK is handled directly in processAck now)
+        if (_ms->getMillis() - pending_outbox[i].time > NORMAL_SEND_TIMEOUT_MS) {
+          pending_outbox[i].waitingForAck = false;
+          pending_outbox[i].retryCount++;
+          anyWaitingForAck = false;
+          
+          if (pending_outbox[i].retryCount > NORMAL_SEND_MAX_RETRIES) {
+            // No more retries, give up
+            Serial.printf("   Outbox #%d failed after %d retries\n", i, NORMAL_SEND_MAX_RETRIES);
+            clearPendingOutbox(&pending_outbox[i]);
+          } else {
+            // Queue retry with delay
+            Serial.printf("   Outbox #%d timed out, retry %d/%d\n", i, 
+                          pending_outbox[i].retryCount, NORMAL_SEND_MAX_RETRIES);
+            pending_outbox[i].time = _ms->getMillis();  // Reset time for next attempt
+          }
+        }
+        break;  // Only check one waiting message per loop
+      }
+    }
+    
+    // Only try to send if no message is currently waiting for ACK
+    if (!anyWaitingForAck) {
+      for (int i = 0; i < MAX_PENDING_OUTBOX; i++) {
+        if (!pending_outbox[i].active || pending_outbox[i].waitingForAck) continue;
+        
+        // Ready to send (after delay from queue time)
+        unsigned long requiredDelay = (pending_outbox[i].retryCount > 0) ? NORMAL_SEND_RETRY_DELAY_MS : 100;
+        if (_ms->getMillis() - pending_outbox[i].time > requiredDelay) {
+          if (!sendQueuedWDPMessage(&pending_outbox[i])) {
+            // Send failed, schedule retry with longer delay
+            pending_outbox[i].retryCount++;
+            if (pending_outbox[i].retryCount > NORMAL_SEND_MAX_RETRIES) {
+              Serial.printf("   Outbox #%d send failed after %d retries\n", i, NORMAL_SEND_MAX_RETRIES);
+              clearPendingOutbox(&pending_outbox[i]);
+            } else {
+              Serial.printf("   Outbox #%d send failed, will retry (%d/%d) in %lums\n",
+                            i, pending_outbox[i].retryCount, NORMAL_SEND_MAX_RETRIES, NORMAL_SEND_RETRY_DELAY_MS);
+              pending_outbox[i].time = _ms->getMillis();
+            }
+          }
+          break;  // Only process one per loop iteration
+        }
       }
     }
 #endif
