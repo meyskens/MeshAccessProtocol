@@ -111,6 +111,13 @@ static size_t ap_meshResponseLen = 0;
 static bool ap_meshResponseReady = false;
 static uint8_t ap_meshResponseTid = 0;
 
+// Early header sending state - send HTTP headers when first packet arrives
+static WiFiClient* ap_waitingClient = nullptr;    // Client waiting for mesh response
+static bool ap_headersSent = false;               // Have we already sent HTTP headers?
+static HTTPResponse ap_earlyResponse;             // Decoded response headers from first packet
+static bool ap_isWMLC = false;                    // Is response WMLC that needs decompilation?
+static size_t ap_bodyBytesReceived = 0;           // Track body bytes for progress
+
 // Keep-alive interval for HTTP clients waiting for mesh response (ms)
 static const unsigned long AP_KEEPALIVE_INTERVAL_MS = 2000;
 
@@ -441,9 +448,14 @@ bool sendWAPRequestViaMesh(const uint8_t* request, size_t requestLen,
   httpServer.end();
   Serial.println("AP-HTTP: Stopped HTTP server during mesh request");
   
-  // Clear any previous response
+  // Clear any previous response and early header state
   ap_meshResponseReady = false;
   ap_meshResponseLen = 0;
+  ap_waitingClient = keepAliveClient;
+  ap_headersSent = false;
+  ap_isWMLC = false;
+  ap_bodyBytesReceived = 0;
+  memset(&ap_earlyResponse, 0, sizeof(ap_earlyResponse));
   
   // Generate random source port for this request (used for response routing)
   ap_currentRequestPort = ap_generateSourcePort();
@@ -470,6 +482,8 @@ bool sendWAPRequestViaMesh(const uint8_t* request, size_t requestLen,
       ap_meshResponseReady = false;
       ap_currentRequestPort = 0;
       ap_requestInProgress = false;
+      ap_waitingClient = nullptr;
+      ap_headersSent = false;
       ap_restoreNormalDisplay();
       httpServer.begin();  // Restart HTTP server
       Serial.println("AP-HTTP: Restarted HTTP server after client disconnect");
@@ -480,12 +494,12 @@ bool sendWAPRequestViaMesh(const uint8_t* request, size_t requestLen,
     // Note: This works because we haven't sent headers yet, and leading whitespace
     // before HTTP response is tolerated by UC Browser, we should revisit this to see
     // if our SYN no reply is enough as this does upset any proper browser.
-    if (keepAliveClient && (millis() - lastKeepAlive) >= AP_KEEPALIVE_INTERVAL_MS) {
-      // Send a single space as keep-alive
-      keepAliveClient->write(' ');
-      keepAliveClient->flush();
-      lastKeepAlive = millis();
-    }
+    //if (keepAliveClient && (millis() - lastKeepAlive) >= AP_KEEPALIVE_INTERVAL_MS) {
+    //  // Send a single space as keep-alive
+    //  keepAliveClient->write(' ');
+    //  keepAliveClient->flush();
+    //  lastKeepAlive = millis();
+    //}
     
     // Check if response has arrived via mesh
     if (ap_meshResponseReady) {
@@ -494,6 +508,7 @@ bool sendWAPRequestViaMesh(const uint8_t* request, size_t requestLen,
       *responseLen = copyLen;
       ap_meshResponseReady = false;
       ap_requestInProgress = false;
+      ap_waitingClient = nullptr;  // Clear client reference
       httpServer.begin();  // Restart HTTP server
       Serial.println("AP-HTTP: Restarted HTTP server after mesh response");
       Serial.printf("AP-HTTP: Received %zu bytes response via mesh\n", copyLen);
@@ -504,6 +519,8 @@ bool sendWAPRequestViaMesh(const uint8_t* request, size_t requestLen,
   }
   
   ap_requestInProgress = false;
+  ap_waitingClient = nullptr;  // Clear client reference
+  ap_headersSent = false;
   ap_restoreNormalDisplay();
   httpServer.begin();  // Restart HTTP server
   Serial.println("AP-HTTP: Restarted HTTP server after timeout");
@@ -612,62 +629,93 @@ void handleHTTPRequest(WiFiClient& client) {
     return;
   }
   
-  // Decode WAP response
-  HTTPResponse wapResp;
-  if (!WAPResponse::decode(http_wapResponse, wapResponseLen, &wapResp)) {
-    client.println("HTTP/1.1 502 Bad Gateway");
-    client.println("Content-Type: text/plain");
-    client.println("Connection: close");
-    client.println();
-    client.println("Failed to decode WAPBOX response");
-    return;
-  }
-  
-  Serial.printf("HTTP: WAP response status=%d type=%s bodyLen=%zu\n", 
-                wapResp.statusCode, wapResp.contentType, wapResp.bodyLen);
-  
-  // Check if response is WMLC and needs decompilation, any browser that can talk HTTP doesn not handle WMLC
-  bool isWMLC = (strstr(wapResp.contentType, "wmlc") != nullptr);
-  
-  size_t decompiledLen = 0;
-  const uint8_t* responseBody = wapResp.body;
-  size_t responseBodyLen = wapResp.bodyLen;
-  const char* responseContentType = wapResp.contentType;
-  
-  if (isWMLC && wapResp.body != nullptr && wapResp.bodyLen > 0) {
-    // Decompile WMLC to WML (using static buffer)
-    decompiledLen = WMLCDecompiler::decompile(wapResp.body, wapResp.bodyLen, 
-                                               http_decompiled, sizeof(http_decompiled));
-    if (decompiledLen > 0) {
-      Serial.printf("HTTP: Decompiled %zu bytes WMLC to %zu bytes WML\n", 
-                    wapResp.bodyLen, decompiledLen);
-      responseBody = (const uint8_t*)http_decompiled;
-      responseBodyLen = decompiledLen;
-      responseContentType = "text/vnd.wap.wml; charset=utf-8";
+  // Check if headers were already sent early (when first packet arrived)
+  if (ap_headersSent) {
+    // Headers already sent - just need to send remaining body
+    Serial.println("HTTP: Headers already sent early, sending body now");
+    
+    // For WMLC, we need to decompile the complete body
+    if (ap_isWMLC && ap_meshResponseLen > 0) {
+      // Get body from the complete response buffer
+      HTTPResponse wapResp;
+      if (WAPResponse::decode(http_wapResponse, wapResponseLen, &wapResp) && 
+          wapResp.body != nullptr && wapResp.bodyLen > 0) {
+        size_t decompiledLen = WMLCDecompiler::decompile(wapResp.body, wapResp.bodyLen, 
+                                                          http_decompiled, sizeof(http_decompiled));
+        if (decompiledLen > 0) {
+          Serial.printf("HTTP: Decompiled %zu bytes WMLC to %zu bytes WML\n", 
+                        wapResp.bodyLen, decompiledLen);
+          client.write((const uint8_t*)http_decompiled, decompiledLen);
+        } else {
+          // Decompilation failed, send raw
+          client.write(wapResp.body, wapResp.bodyLen);
+        }
+      }
     } else {
-      Serial.println("HTTP: WMLC decompilation failed, sending raw");
+      // Non-WMLC: body was already streamed as packets arrived
+      // Nothing more to send
     }
+    
+    ap_headersSent = false;
+    Serial.printf("HTTP: Response complete (headers sent early)\n");
+  } else {
+    // Normal path - headers not sent yet, decode and send everything
+    HTTPResponse wapResp;
+    if (!WAPResponse::decode(http_wapResponse, wapResponseLen, &wapResp)) {
+      client.println("HTTP/1.1 502 Bad Gateway");
+      client.println("Content-Type: text/plain");
+      client.println("Connection: close");
+      client.println();
+      client.println("Failed to decode WAPBOX response");
+      return;
+    }
+    
+    Serial.printf("HTTP: WAP response status=%d type=%s bodyLen=%zu\n", 
+                  wapResp.statusCode, wapResp.contentType, wapResp.bodyLen);
+    
+    // Check if response is WMLC and needs decompilation
+    bool isWMLC = (strstr(wapResp.contentType, "wmlc") != nullptr);
+    
+    size_t decompiledLen = 0;
+    const uint8_t* responseBody = wapResp.body;
+    size_t responseBodyLen = wapResp.bodyLen;
+    const char* responseContentType = wapResp.contentType;
+    
+    if (isWMLC && wapResp.body != nullptr && wapResp.bodyLen > 0) {
+      // Decompile WMLC to WML (using static buffer)
+      decompiledLen = WMLCDecompiler::decompile(wapResp.body, wapResp.bodyLen, 
+                                                 http_decompiled, sizeof(http_decompiled));
+      if (decompiledLen > 0) {
+        Serial.printf("HTTP: Decompiled %zu bytes WMLC to %zu bytes WML\n", 
+                      wapResp.bodyLen, decompiledLen);
+        responseBody = (const uint8_t*)http_decompiled;
+        responseBodyLen = decompiledLen;
+        responseContentType = "text/vnd.wap.wml; charset=utf-8";
+      } else {
+        Serial.println("HTTP: WMLC decompilation failed, sending raw");
+      }
+    }
+    
+    // Send HTTP response to client
+    client.printf("HTTP/1.1 %d %s\r\n", wapResp.statusCode, wapResp.statusText);
+    client.printf("Content-Type: %s\r\n", responseContentType);
+    client.printf("Content-Length: %zu\r\n", responseBodyLen);
+    client.println("Connection: close");
+    
+    // Add original server header if present
+    if (strlen(wapResp.server) > 0) {
+      client.printf("Server: %s\r\n", wapResp.server);
+    }
+    
+    client.println();  // End of headers
+    
+    // Send body
+    if (responseBody != nullptr && responseBodyLen > 0) {
+      client.write(responseBody, responseBodyLen);
+    }
+    
+    Serial.printf("HTTP: Sent response %d with %zu bytes\n", wapResp.statusCode, responseBodyLen);
   }
-  
-  // Send HTTP response to client
-  client.printf("HTTP/1.1 %d %s\r\n", wapResp.statusCode, wapResp.statusText);
-  client.printf("Content-Type: %s\r\n", responseContentType);
-  client.printf("Content-Length: %zu\r\n", responseBodyLen);
-  client.println("Connection: close");
-  
-  // Add original server header if present
-  if (strlen(wapResp.server) > 0) {
-    client.printf("Server: %s\r\n", wapResp.server);
-  }
-  
-  client.println();  // End of headers
-  
-  // Send body
-  if (responseBody != nullptr && responseBodyLen > 0) {
-    client.write(responseBody, responseBodyLen);
-  }
-  
-  Serial.printf("HTTP: Sent response %d with %zu bytes\n", wapResp.statusCode, responseBodyLen);
   
   // Restore normal display after HTTP response is complete
   ap_restoreNormalDisplay();
@@ -852,6 +900,69 @@ bool ap_incrementProxyDiscoveryAttempt() {
 }
 
 /**
+ * Try to decode and send HTTP headers early from the first packet
+ * Returns true if headers were successfully sent
+ */
+bool ap_trySendEarlyHeaders(const uint8_t* wspData, size_t wspLen) {
+  if (!ap_waitingClient || ap_headersSent) {
+    return false;  // No client waiting or headers already sent
+  }
+  
+  // Try to decode WSP headers from first packet
+  if (!WAPResponse::decode(wspData, wspLen, &ap_earlyResponse)) {
+    Serial.println("AP-WDP: Could not decode headers from first packet");
+    return false;
+  }
+  
+  // Check if this is WMLC that needs decompilation
+  ap_isWMLC = (strstr(ap_earlyResponse.contentType, "wmlc") != nullptr);
+  
+  // Determine content type to send
+  const char* responseContentType = ap_earlyResponse.contentType;
+  if (ap_isWMLC) {
+    // For WMLC, we'll decompile later so advertise WML type
+    // But we can't know the final size, so use chunked or don't send Content-Length yet
+    // Actually, we need to buffer WMLC for decompilation, so don't stream body
+    responseContentType = "text/vnd.wap.wml; charset=utf-8";
+  }
+  
+  Serial.printf("AP-WDP: Sending early headers - status=%d type=%s\n", 
+                ap_earlyResponse.statusCode, responseContentType);
+  
+  // Send HTTP headers immediately
+  ap_waitingClient->printf("HTTP/1.1 %d %s\r\n", ap_earlyResponse.statusCode, ap_earlyResponse.statusText);
+  ap_waitingClient->printf("Content-Type: %s\r\n", responseContentType);
+  
+  // For non-WMLC, we can stream the body as it arrives
+  // For WMLC, we need to buffer and decompile, so omit Content-Length for now
+  // (we'll use Connection: close to signal end)
+  if (!ap_isWMLC && ap_earlyResponse.contentLength > 0) {
+    ap_waitingClient->printf("Content-Length: %zu\r\n", ap_earlyResponse.contentLength);
+  }
+  
+  ap_waitingClient->println("Connection: close");
+  
+  // Add original server header if present
+  if (strlen(ap_earlyResponse.server) > 0) {
+    ap_waitingClient->printf("Server: %s\r\n", ap_earlyResponse.server);
+  }
+  
+  ap_waitingClient->println();  // End of headers
+  ap_waitingClient->flush();
+  
+  // If not WMLC and we have body data in this first packet, send it now
+  if (!ap_isWMLC && ap_earlyResponse.body != nullptr && ap_earlyResponse.bodyLen > 0) {
+    ap_waitingClient->write(ap_earlyResponse.body, ap_earlyResponse.bodyLen);
+    ap_waitingClient->flush();
+    ap_bodyBytesReceived = ap_earlyResponse.bodyLen;
+    Serial.printf("AP-WDP: Sent %zu body bytes from first packet\n", ap_earlyResponse.bodyLen);
+  }
+  
+  ap_headersSent = true;
+  return true;
+}
+
+/**
  * Handle incoming mesh message (response from proxy node)
  * This handles both simple and concatenated messages
  */
@@ -929,6 +1040,25 @@ void ap_handleIncomingMesh(const String& from, const uint8_t* data, size_t len) 
         // Update display with receive progress
         ap_wdpReceivedParts = concat->receivedParts;
         ap_updateWDPDisplay();
+        
+        // On first part, try to decode and send headers early
+        // this will stop browsers from timing out
+        // since WML headers will almost always fit in first part this is a perfect optimization
+        if (currentPart == 1 && !ap_headersSent && ap_waitingClient) {
+          // Verify port match first
+          if (ap_currentRequestPort == 0 || concat->destPort == ap_currentRequestPort) {
+            ap_trySendEarlyHeaders(&data[12], partPayloadLen);
+          }
+        } else if (!ap_isWMLC && ap_headersSent && ap_waitingClient && ap_waitingClient->connected()) {
+          // For non-WMLC responses, stream body data as it arrives
+          // Skip the WSP header bytes (they're in the first packet)
+          if (currentPart > 1) {
+            ap_waitingClient->write(&data[12], partPayloadLen);
+            ap_waitingClient->flush();
+            ap_bodyBytesReceived += partPayloadLen;
+            Serial.printf("AP-WDP: Streamed %zu body bytes (part %d)\n", partPayloadLen, currentPart);
+          }
+        }
       }
     }
     
@@ -976,6 +1106,11 @@ void ap_handleIncomingMesh(const String& from, const uint8_t* data, size_t len) 
   
   payload = data + 7;  // Skip UDH
   payloadLen = len - 7;
+  
+  // For simple messages, try to send headers early too
+  if (!ap_headersSent && ap_waitingClient) {
+    ap_trySendEarlyHeaders(payload, payloadLen);
+  }
   
   // Copy to response buffer
   if (payloadLen < sizeof(ap_meshResponseBuffer)) {
