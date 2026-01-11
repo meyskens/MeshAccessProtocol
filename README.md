@@ -77,6 +77,10 @@ There are a few options:
 
 We are working at [Bevelgacom](https://github.com/bevelgacom/) to create lots of WML content compatible with the earliest WAP devices and building the mordern WAP portal! Check it out on [http://wap.bevelgacom.be/](http://wap.bevelgacom.be/) (works with MAP too!).
 
+### Known power issue
+
+The proxy node needs a battery connected and needs USB-C disconnected to boot properly. Starting both WiFi and LoRa at the same time will cause a brownout on USB powered mode. Workaround is to disconnect USB-C after flashing and then reset the device. If you know a fix, PRs are welcome!
+
 ### Prerequisites
 
 - [PlatformIO](https://platformio.org/)
