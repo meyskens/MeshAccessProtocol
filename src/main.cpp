@@ -74,7 +74,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ 21, /* clock=*/
 #ifndef LORA_SF
   #define LORA_SF     8        // SF8 for maximum range
 #endif
-#ifndef LORA_CRa
+#ifndef LORA_CR
   #define LORA_CR      8        // coding rate
 #endif
 #ifndef LORA_TX_POWER
@@ -93,6 +93,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ 21, /* clock=*/
 #define DIRECT_SEND_PERHOP_EXTRA_MILLIS   250
 
 #define  PUBLIC_GROUP_PSK  "izOH6cXN6mrJ5e26oRXNcg=="
+#define  MCRADAR_GROUP_PSK "8nrPC/GFwuxLn9Nr8S+h7g=="
 
 /* --------------------------------End of configuration------------------------------------ */
 
@@ -125,6 +126,7 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
   NodePrefs _prefs;
   uint32_t expected_ack_crc;
   ChannelDetails* _public;
+  ChannelDetails* _radar; //for mc-radar
   unsigned long last_msg_sent;
   ContactInfo* curr_recipient;
   char command[512+10];
@@ -903,6 +905,7 @@ public:
 
     loadContacts();
     _public = addChannel("Public", PUBLIC_GROUP_PSK);
+    _radar = addChannel("MC-Radar", MCRADAR_GROUP_PSK);
   }
 
   void savePrefs() {
@@ -974,6 +977,23 @@ public:
 
       int len = strlen((char *) &temp[5]);
       auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _public->channel, temp, 5 + len);
+      if (pkt) {
+        sendFlood(pkt);
+        Serial.println("   Sent.");
+      } else {
+        Serial.println("   ERROR: unable to send");
+      }
+    } else if (memcmp(command, "mc-radar ", 9) == 0) { //send msg in #mc-radar
+      uint8_t temp[5+MAX_TEXT_LEN+32];
+      uint32_t timestamp = getRTCClock()->getCurrentTime();
+      memcpy(temp, &timestamp, 4);   // mostly an extra blob to help make packet_hash unique
+      temp[4] = 0;  // attempt and flags
+
+      sprintf((char *) &temp[5], "%s: %s", _prefs.node_name, &command[9]);  // <sender>: <msg>
+      temp[5 + MAX_TEXT_LEN] = 0;  // truncate if too long
+
+      int len = strlen((char *) &temp[5]);
+      auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _radar->channel, temp, 5 + len);
       if (pkt) {
         sendFlood(pkt);
         Serial.println("   Sent.");
@@ -1081,6 +1101,7 @@ public:
       Serial.println("   advert");
       Serial.println("   reset path");
       Serial.println("   public <text>");
+      Serial.println("   mc-radar <text>");
     } else {
       Serial.print("   ERROR: unknown command: "); Serial.println(command);
     }
