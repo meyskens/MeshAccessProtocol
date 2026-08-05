@@ -119,7 +119,7 @@ Default settings optimized for EU868 narrow:
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency | 869.617 MHz |
+| Frequency | 869.618 MHz |
 | Bandwidth | 62.50 kHz |
 | Spreading Factor | SF8 |
 | Coding Rate | 4/8 |
