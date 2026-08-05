@@ -353,14 +353,32 @@ protected:
 
     // Only add nodes whose name starts with "MAP-" to the contact list
     if (is_new && strncmp(contact.name, "MAP-", 4) == 0) {
-      if (addContact(contact)) {
-        Serial.printf("   Added MAP- contact: %s\n", contact.name);
-        saveContacts();
+      if (!addContact(contact)) {
+        // Contact list is full - evict the oldest contact (by last_advert_timestamp)
+        // and try again, so the proxy node can always be added.
+        int oldest_idx = 0;
+        for (int i = 1; i < getNumContacts(); i++) {
+          ContactInfo ci;
+          getContactByIdx(i, ci);
+          ContactInfo oldest;
+          getContactByIdx(oldest_idx, oldest);
+          if (ci.last_advert_timestamp < oldest.last_advert_timestamp) {
+            oldest_idx = i;
+          }
+        }
+        ContactInfo oldest;
+        if (getContactByIdx(oldest_idx, oldest)) {
+          Serial.printf("   Contact list full - evicting oldest: %s\n", oldest.name);
+          removeContact(oldest);
+        }
+        if (!addContact(contact)) {
+          Serial.println("   ERROR: could not add MAP- contact even after eviction!");
+          return;
+        }
       }
-    } else if (!is_new) {
-      // Existing contact was updated (name/type/gps/timestamps)
-      saveContacts();
-    }
+    } 
+    Serial.printf("   Added MAP- contact: %s\n", contact.name);
+    saveContacts();
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
@@ -1271,16 +1289,14 @@ public:
         saveContacts();
         Serial.println("   Done.");
       }
-    } else if (strcmp(command, "reset contacts") == 0) {
-      // Delete contacts file from filesystem
+    } else if (strcmp(command, "reset contacts") == 0 || strcmp(command, "clear-contacts") == 0) {
+      // Clear all contacts: in-memory list and persisted file
+      resetContacts();
       if (_fs->exists("/contacts")) {
         _fs->remove("/contacts");
-        Serial.println("   Contacts file deleted.");
-      } else {
-        Serial.println("   No contacts file found.");
       }
       curr_recipient = nullptr;
-      Serial.println("   OK - reboot to clear in-memory contacts");
+      Serial.println("   All contacts cleared.");
     } else if (memcmp(command, "card", 4) == 0) {
       Serial.printf("Hello %s\n", _prefs.node_name);
       auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
@@ -1342,6 +1358,7 @@ public:
       Serial.println("   advert");
       Serial.println("   reset path");
       Serial.println("   reset contacts");
+      Serial.println("   clear-contacts");
       Serial.println("   public <text>");
       Serial.println("   mc-radar <text>");
     } else {
