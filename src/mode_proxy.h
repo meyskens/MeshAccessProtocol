@@ -543,10 +543,16 @@ bool proxy_syncTimeFromNTP();
 void proxy_connectToWiFi(const char* ssid, const char* password) {
   Serial.println("DEBUG: Starting WiFi connection (Proxy Mode)...");
   displayStatus("WiFi [Proxy]", "Connecting to:", ssid, nullptr);
-  
+
+  // Reduce WiFi TX power during connection to limit inrush current.
+  // The ESP32 WiFi PA can draw significant current; combined with the LoRa
+  // PA this can brown out the regulator on USB-only power. We restore
+  // full power after the connection is established and stable.
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_11dBm);  // Low power during connect
+  delay(50);  // Let WiFi radio settle at low power before associating
   WiFi.begin(ssid, password);
-  
+
   int attempts = 0;
   const int maxAttempts = 30;  // 15 seconds timeout
   
@@ -575,6 +581,12 @@ void proxy_connectToWiFi(const char* ssid, const char* password) {
     Serial.println("DEBUG: WiFi connected!");
     Serial.print("DEBUG: IP address: ");
     Serial.println(WiFi.localIP());
+
+    // Restore full WiFi TX power now that the connection is stable and
+    // the LoRa PA has had time to settle. Doing this after the association
+    // keeps the peak current during connect lower.
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Full power for normal operation
+    delay(50);  // Let PA settle at new power level
     
     char ipLine[32];
     snprintf(ipLine, sizeof(ipLine), "IP: %s", WiFi.localIP().toString().c_str());
