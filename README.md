@@ -7,7 +7,7 @@ MeshAccessProtocol bridges WAP (Wireless Application Protocol) and MeshCore LoRa
 
 ## OMG WHY?
 
-[MeshCore](https://meshcore.co.uk) is a very neat and well scaling LoRa based mesh network. However as is the case with
+[MeshCore](https://meshcore.io) is a very neat and well scaling LoRa based mesh network. However as is the case with
 many of these is focussed on messaging. Not a bad thing for sure, but what if we can enable off-grid web browsing?
 
 MeshCore is designed to handle small messages (up to 150 bytes). Thinking about this is that it is very similar to SMS.
