@@ -1876,7 +1876,7 @@ void setup() {
   displayStatus("MeshAccessProtocol", "Radio OK", "Seeding RNG...");
 
   Serial.println("DEBUG: Seeding RNG...");
-  fast_rng.begin(radio_get_rng_seed());
+  fast_rng.begin(radio_driver.getRngSeed());
   Serial.println("DEBUG: RNG seeded");
 
 #if defined(NRF52_PLATFORM)
@@ -1902,9 +1902,9 @@ void setup() {
   displayStatus("MeshAccessProtocol", "Radio OK", "Configuring...");
 
   Serial.println("DEBUG: Setting radio params...");
-  radio_set_params(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
+  radio_driver.setParams(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
   Serial.println("DEBUG: Setting TX power...");
-  radio_set_tx_power(the_mesh.getTxPowerPref());
+  radio_driver.setTxPower(the_mesh.getTxPowerPref());
   Serial.println("DEBUG: Radio configured");
 
   the_mesh.showWelcome();
