@@ -55,7 +55,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ 21, /* clock=*/
 
 /* ---------------------------------- CONFIGURATION ------------------------------------- */
 
-#define FIRMWARE_VER_TEXT   "MAPv1 (build: 10 Jan 2026)"
+#define FIRMWARE_VER_TEXT   "MAPv1 (build: 5 Aug 2026)"
 
 // WDP Gateway Configuration
 #define WAPBOX_HOST         "206.83.40.166" // bevelgacom public WAP gateway
