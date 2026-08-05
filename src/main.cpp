@@ -66,7 +66,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ 21, /* clock=*/
 
 // EU868 Long Range Settings
 #ifndef LORA_FREQ
-  #define LORA_FREQ   869.617   // EU868 band
+  #define LORA_FREQ   869.618   // EU868 band
 #endif
 #ifndef LORA_BW
   #define LORA_BW     62.50       // 62.50  kHz bandwidth for narrow
@@ -78,7 +78,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ 21, /* clock=*/
   #define LORA_CR      8        // coding rate
 #endif
 #ifndef LORA_TX_POWER
-  #define LORA_TX_POWER  22     // Max power for EU 869.617 MHz (up to 27 dBm allowed)
+  #define LORA_TX_POWER  22     // Max power for EU 869 MHz (up to 27 dBm allowed)
 #endif
 
 #ifndef MAX_CONTACTS
@@ -90,8 +90,14 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ 21, /* clock=*/
 // 2 = 2-byte hash (65,536 unique ids, 32 max hops) -- recommended for v1.14+ meshes
 // 3 = 3-byte hash (16M unique ids, 21 max hops)
 // NOTE: repeaters on firmware < 1.14 will silently drop 2- and 3-byte path hash packets.
-#ifndef PATH_HASH_SIZE
-  #define PATH_HASH_SIZE       2
+//
+// IMPORTANT: This is the *repeater path hash size* passed to sendFlood() at runtime,
+// and is DISTINCT from the library's PATH_HASH_SIZE compile-time constant (which is
+// the node identity hash size, hardcoded to 1 in MeshCore.h). The library defines
+// PATH_HASH_SIZE before this file is parsed, so a #ifndef guard here can never
+// override it. Use FLOOD_PATH_HASH_SIZE for the flood path hash size instead.
+#ifndef FLOOD_PATH_HASH_SIZE
+  #define FLOOD_PATH_HASH_SIZE  2
 #endif
 
 #include <helpers/BaseChatMesh.h>
@@ -349,6 +355,27 @@ protected:
     return false;
   }
 
+  // Override sendFloodScoped() to use FLOOD_PATH_HASH_SIZE for ALL flood sends
+  // that go through BaseChatMesh (sendMessage, sendGroupMessage, sendLogin,
+  // sendAnonReq, sendRequest, ACK/path-return replies, etc.).
+  //
+  // The library's default impl calls sendFlood(pkt, delay_millis) WITHOUT a
+  // path_hash_size argument, so it always defaults to 1-byte hashes. That means
+  // direct messages (sendMessage with OUT_PATH_UNKNOWN), group messages, and
+  // even the reciprocal path-return packets sent after receiving a message all
+  // used 1-byte repeater hashes -- regardless of the FLOOD_PATH_HASH_SIZE we
+  // pass to our own sendFlood() calls in handleCommand().
+  //
+  // By overriding here we ensure every flood-routed packet originating from
+  // BaseChatMesh uses 2-byte (FLOOD_PATH_HASH_SIZE) repeater path hashes, so
+  // learned direct paths also inherit the 2-byte hash size.
+  void sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis=0) override {
+    sendFlood(pkt, delay_millis, FLOOD_PATH_HASH_SIZE);
+  }
+  void sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis=0) override {
+    sendFlood(pkt, delay_millis, FLOOD_PATH_HASH_SIZE);
+  }
+
   // Only auto-add contacts whose name starts with "MAP-" - this prevents
   // the contact list from filling up with unrelated nodes
   bool isAutoAddEnabled() const override {
@@ -385,13 +412,17 @@ protected:
           return;
         }
       }
+
+      Serial.printf("   Added MAP- contact: %s\n", contact.name);
+      saveContacts();
     } 
-    Serial.printf("   Added MAP- contact: %s\n", contact.name);
-    saveContacts();
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
-    Serial.printf("PATH to: %s, path_len=%d\n", contact.name, (int32_t) contact.out_path_len);
+    Serial.printf("PATH to: %s, out_path_len=0x%02X (hops=%d, hash_size=%d)\n", 
+                  contact.name, (int32_t) contact.out_path_len,
+                  (int32_t)(contact.out_path_len & 63),
+                  (int32_t)((contact.out_path_len >> 6) + 1));
     saveContacts();
   }
 
@@ -717,7 +748,7 @@ protected:
     if (pkt->isRouteDirect()) {
       Serial.printf("PUBLIC CHANNEL MSG -> (Direct!)\n");
     } else {
-      Serial.printf("PUBLIC CHANNEL MSG -> (Flood) hops %d\n", pkt->path_len);
+      Serial.printf("PUBLIC CHANNEL MSG -> (Flood) hops %d\n", pkt->path_len & 63);
     }
     Serial.printf("   %s\n", text);
   }
@@ -734,8 +765,10 @@ protected:
     return SEND_TIMEOUT_BASE_MILLIS + (FLOOD_SEND_TIMEOUT_FACTOR * pkt_airtime_millis);
   }
   uint32_t calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t path_len) const override {
+    // path_len is encoded: upper 2 bits = hash size encoding, lower 6 bits = hop count
+    uint8_t path_hash_count = path_len & 63;
     return SEND_TIMEOUT_BASE_MILLIS + 
-         ( (pkt_airtime_millis*DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (path_len + 1));
+         ( (pkt_airtime_millis*DIRECT_SEND_PERHOP_FACTOR + DIRECT_SEND_PERHOP_EXTRA_MILLIS) * (path_hash_count + 1));
   }
 
   void onSendTimeout() override {
@@ -782,6 +815,7 @@ public:
   
   // Get path length (hop count) to a recipient by their hex ID prefix
   // Returns 0 for direct contact (no hops), >0 for multi-hop path, 255 if not found
+  // NOTE: out_path_len is encoded (upper 2 bits = hash size, lower 6 bits = hop count)
   uint8_t getPathLengthForRecipient(const String& recipientId) {
     uint8_t targetPrefix[4];
     for (int i = 0; i < 4 && i*2 < (int)recipientId.length(); i++) {
@@ -795,7 +829,8 @@ public:
       return 64;  // Not found
     }
     
-    return contact->out_path_len;
+    // Decode hop count from encoded out_path_len (lower 6 bits)
+    return contact->out_path_len & 63;
   }
   
   // Calculate estimated packet airtime in milliseconds for given payload size
@@ -897,21 +932,22 @@ public:
       // ACK was received (proxy_ping_expected_ack_crc is cleared in processAck)
       proxy_ping_pending = false;
       
-      // Get updated path length
+      // Get updated path length (decode hop count from encoded out_path_len)
       ContactInfo* proxy = getProxyContact();
       if (proxy) {
-        Serial.printf("AP-Discovery: Proxy path discovered! path_len=%d\n", proxy->out_path_len);
-        ap_setProxyPathDiscovered(proxy->out_path_len);
+        uint8_t hopCount = proxy->out_path_len & 63;  // lower 6 bits = hop count
+        Serial.printf("AP-Discovery: Proxy path discovered! out_path_len=0x%02X, hops=%d\n", proxy->out_path_len, hopCount);
+        ap_setProxyPathDiscovered(hopCount);
         updateDisplay();
       }
     }
   }
 
-  // Get current proxy path length (or -1 if unknown)
+  // Get current proxy path length (hop count, or -1 if unknown)
   int getProxyPathLen() {
     ContactInfo* proxy = getProxyContact();
     if (proxy && ap_isProxyPathDiscovered()) {
-      return proxy->out_path_len;
+      return proxy->out_path_len & 63;  // Decode hop count from encoded out_path_len
     }
     return -1;
   }
@@ -1193,7 +1229,7 @@ public:
   void sendSelfAdvert(int delay_millis) {
     auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
     if (pkt) {
-      sendFlood(pkt, delay_millis, PATH_HASH_SIZE);
+      sendFlood(pkt, delay_millis, FLOOD_PATH_HASH_SIZE);
     }
   }
 
@@ -1235,7 +1271,7 @@ public:
       int len = strlen((char *) &temp[5]);
       auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _public->channel, temp, 5 + len);
       if (pkt) {
-        sendFlood(pkt, (uint32_t)0, PATH_HASH_SIZE);
+        sendFlood(pkt, (uint32_t)0, FLOOD_PATH_HASH_SIZE);
         Serial.println("   Sent.");
       } else {
         Serial.println("   ERROR: unable to send");
@@ -1252,7 +1288,7 @@ public:
       int len = strlen((char *) &temp[5]);
       auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _radar->channel, temp, 5 + len);
       if (pkt) {
-        sendFlood(pkt, (uint32_t)0, PATH_HASH_SIZE);
+        sendFlood(pkt, (uint32_t)0, FLOOD_PATH_HASH_SIZE);
         Serial.println("   Sent.");
       } else {
         Serial.println("   ERROR: unable to send");
@@ -1657,7 +1693,8 @@ public:
         unsigned long requiredDelay = (pending_outbox[i].retryCount > 0) ? NORMAL_SEND_RETRY_DELAY_MS : 100;
         
         // For multi-hop paths, ensure we wait at least the packet airtime since last send
-        if (contact && contact->out_path_len > 0) {
+        // out_path_len is encoded; lower 6 bits = hop count (0 means direct/unknown)
+        if (contact && (contact->out_path_len & 63) > 0) {
           uint32_t airtimeMs = calcPacketAirtimeMs(MESHCORE_MAX_BINARY_PAYLOAD);
           unsigned long timeSinceLastSend = _ms->getMillis() - last_wdp_send_time;
           if (timeSinceLastSend < airtimeMs) {
@@ -1857,6 +1894,8 @@ void setup() {
   Serial.println("DEBUG: Calling board.begin()...");
   board.begin();
   Serial.println("DEBUG: board.begin() done");
+  // Let board peripherals settle after power-up inrush
+  delay(100);
 
   displayStatus("MeshAccessProtocol", "Radio init...");
 
@@ -1867,11 +1906,8 @@ void setup() {
     halt(); 
   }
   Serial.println("DEBUG: radio_init() done");
-
-  // Initialize WiFi AFTER radio_init() so NTP sync doesn't get overwritten by rtc_clock.begin()
-#ifdef ESP32
-  initWiFiMode();
-#endif
+  // Let LoRa radio settle after init (SX1262 power-up inrush)
+  delay(200);
 
   displayStatus("MeshAccessProtocol", "Radio OK", "Seeding RNG...");
 
@@ -1904,8 +1940,22 @@ void setup() {
   Serial.println("DEBUG: Setting radio params...");
   radio_driver.setParams(the_mesh.getFreqPref(), LORA_BW, LORA_SF, LORA_CR);
   Serial.println("DEBUG: Setting TX power...");
-  radio_driver.setTxPower(the_mesh.getTxPowerPref());
+  // Ramp TX power gradually to avoid a sudden current spike from the PA
+  // (the SX1262 + ESP32 + WiFi all drawing peak current at once can brown
+  //  out the regulator on USB-only power)
+  {
+    uint8_t targetPower = the_mesh.getTxPowerPref();
+    uint8_t stepPower = (targetPower > 10) ? 10 : targetPower;
+    while (stepPower < targetPower) {
+      radio_driver.setTxPower(stepPower);
+      delay(50);
+      stepPower = (stepPower + 4 > targetPower) ? targetPower : stepPower + 4;
+    }
+    radio_driver.setTxPower(targetPower);
+  }
   Serial.println("DEBUG: Radio configured");
+  // Let radio PA settle after power ramp
+  delay(200);
 
   the_mesh.showWelcome();
 
@@ -1913,6 +1963,16 @@ void setup() {
   the_mesh.updateDisplay();
 
 #ifdef ESP32
+  // Initialize WiFi AFTER the LoRa radio is fully configured and settled.
+  // Starting WiFi (which powers up the ESP32 WiFi radio) while the LoRa PA
+  // is still settling can cause a brownout on USB-only power. By deferring
+  // WiFi init to here, the LoRa radio is stable before WiFi draws current.
+  // NTP sync (which causes WiFi TX/RX bursts) is also deferred, so it no
+  // longer overlaps with LoRa radio init.
+  initWiFiMode();
+  // Let WiFi settle after connect + NTP sync before starting more subsystems
+  delay(200);
+
   // Initialize mode-specific functionality
   #if (OPERATION_MODE == MODE_PROXY)
     if (proxy_isWiFiConnected()) {
@@ -1953,9 +2013,12 @@ void setup() {
   #endif
 #endif
 
-  // send out initial Advertisement to the mesh
+  // send out initial Advertisement to the mesh.
+  // Use a generous delay so the first LoRa TX happens well after all the
+  // power-hungry init steps (WiFi, SPIFFS, radio PA ramp) have settled.
+  // The previous 1200ms was too short when WiFi + NTP ran right before it.
   Serial.println("DEBUG: Sending initial advert...");
-  the_mesh.sendSelfAdvert(1200);   // add slight delay
+  the_mesh.sendSelfAdvert(3000);   // 3s delay - let power rails settle before first TX
   Serial.println("DEBUG: Setup complete!");
 }
 
