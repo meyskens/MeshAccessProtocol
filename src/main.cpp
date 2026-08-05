@@ -85,6 +85,15 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ 21, /* clock=*/
   #define MAX_CONTACTS         100
 #endif
 
+// Path hash size (hop byte size) used when sending flood-routed packets.
+// 1 = 1-byte hash (legacy default, 64 max hops)
+// 2 = 2-byte hash (65,536 unique ids, 32 max hops) -- recommended for v1.14+ meshes
+// 3 = 3-byte hash (16M unique ids, 21 max hops)
+// NOTE: repeaters on firmware < 1.14 will silently drop 2- and 3-byte path hash packets.
+#ifndef PATH_HASH_SIZE
+  #define PATH_HASH_SIZE       2
+#endif
+
 #include <helpers/BaseChatMesh.h>
 
 #define SEND_TIMEOUT_BASE_MILLIS          500
@@ -1184,7 +1193,7 @@ public:
   void sendSelfAdvert(int delay_millis) {
     auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
     if (pkt) {
-      sendFlood(pkt, delay_millis);
+      sendFlood(pkt, delay_millis, PATH_HASH_SIZE);
     }
   }
 
@@ -1226,7 +1235,7 @@ public:
       int len = strlen((char *) &temp[5]);
       auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _public->channel, temp, 5 + len);
       if (pkt) {
-        sendFlood(pkt);
+        sendFlood(pkt, (uint32_t)0, PATH_HASH_SIZE);
         Serial.println("   Sent.");
       } else {
         Serial.println("   ERROR: unable to send");
@@ -1243,7 +1252,7 @@ public:
       int len = strlen((char *) &temp[5]);
       auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _radar->channel, temp, 5 + len);
       if (pkt) {
-        sendFlood(pkt);
+        sendFlood(pkt, (uint32_t)0, PATH_HASH_SIZE);
         Serial.println("   Sent.");
       } else {
         Serial.println("   ERROR: unable to send");
