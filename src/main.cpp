@@ -200,6 +200,9 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
     uint32_t expectedAckCrc;    // Expected ACK CRC for this message
   };
   PendingOutbox pending_outbox[MAX_PENDING_OUTBOX];
+  
+  // Track last WDP send time for inter-send delay (multi-hop paths)
+  unsigned long last_wdp_send_time = 0;
 
   // Clear/reset a pending outbox slot
   void clearPendingOutbox(PendingOutbox* msg) {
@@ -734,6 +737,49 @@ public:
   float getFreqPref() const { return _prefs.freq; }
   uint8_t getTxPowerPref() const { return _prefs.tx_power_dbm; }
   uint32_t getMessagesHandled() const { return messages_handled; }
+  
+  // Get path length (hop count) to a recipient by their hex ID prefix
+  // Returns 0 for direct contact (no hops), >0 for multi-hop path, 255 if not found
+  uint8_t getPathLengthForRecipient(const String& recipientId) {
+    uint8_t targetPrefix[4];
+    for (int i = 0; i < 4 && i*2 < (int)recipientId.length(); i++) {
+      targetPrefix[i] = (hexToNibble(recipientId.charAt(i*2)) << 4) | 
+                        hexToNibble(recipientId.charAt(i*2 + 1));
+    }
+    
+    ContactInfo* contact = lookupContactByPubKey(targetPrefix, 4);
+    if (!contact) {
+      Serial.printf("getPathLengthForRecipient: Contact not found for %s\n", recipientId.c_str());
+      return 64;  // Not found
+    }
+    
+    return contact->out_path_len;
+  }
+  
+  // Calculate estimated packet airtime in milliseconds for given payload size
+  // Uses LoRa parameters defined at compile time (LORA_BW, LORA_SF, LORA_CR)
+  // This is an approximation of the time-on-air for the radio transmission
+  uint32_t calcPacketAirtimeMs(size_t payloadBytes) {
+    // LoRa time-on-air formula (simplified approximation)
+    // Symbol time Ts = 2^SF / BW (in seconds, BW in Hz)
+    // For our settings: SF=8, BW=62.5kHz
+    // Ts = 2^8 / 62500 = 256 / 62500 = 4.096 ms per symbol
+    
+    const float bw_hz = LORA_BW * 1000.0f;  // Convert kHz to Hz
+    const float symbol_time_ms = (1 << LORA_SF) * 1000.0f / bw_hz;
+    
+    // Preamble symbols (typically 8) + 4.25 for sync
+    const float preamble_time_ms = (8 + 4.25f) * symbol_time_ms;
+    
+    // Payload symbols approximation (depends on CR, SF, header mode, etc.)
+    // Simplified: assume ~8 bits per symbol after coding, plus overhead
+    // With CR=4/8, we get 4 data bits per symbol
+    // Each byte needs ~2 symbols plus header overhead
+    float payload_symbols = 8 + (payloadBytes + 20) * 2;  // rough estimate with headers
+    float payload_time_ms = payload_symbols * symbol_time_ms;
+    
+    return (uint32_t)(preamble_time_ms + payload_time_ms);
+  }
 
 #ifdef ESP32
 #if (OPERATION_MODE == MODE_AP)
@@ -970,6 +1016,7 @@ public:
     }
     
     last_msg_sent = _ms->getMillis();
+    last_wdp_send_time = _ms->getMillis();  // Track for inter-send delay on multi-hop paths
     msg->waitingForAck = true;
     msg->expectedAckCrc = expected_ack_crc;
     msg->time = _ms->getMillis();  // Reset time for timeout tracking
@@ -1209,6 +1256,16 @@ public:
         saveContacts();
         Serial.println("   Done.");
       }
+    } else if (strcmp(command, "reset contacts") == 0) {
+      // Delete contacts file from filesystem
+      if (_fs->exists("/contacts")) {
+        _fs->remove("/contacts");
+        Serial.println("   Contacts file deleted.");
+      } else {
+        Serial.println("   No contacts file found.");
+      }
+      curr_recipient = nullptr;
+      Serial.println("   OK - reboot to clear in-memory contacts");
     } else if (memcmp(command, "card", 4) == 0) {
       Serial.printf("Hello %s\n", _prefs.node_name);
       auto pkt = createSelfAdvert(_prefs.node_name, _prefs.node_lat, _prefs.node_lon);
@@ -1269,6 +1326,7 @@ public:
       Serial.println("   send <text>");
       Serial.println("   advert");
       Serial.println("   reset path");
+      Serial.println("   reset contacts");
       Serial.println("   public <text>");
       Serial.println("   mc-radar <text>");
     } else {
@@ -1553,8 +1611,21 @@ public:
       for (int i = 0; i < MAX_PENDING_OUTBOX; i++) {
         if (!pending_outbox[i].active || pending_outbox[i].waitingForAck) continue;
         
-        // Ready to send (after delay from queue time)
+        // Check if path has hops - if so, add airtime delay between sends
+        ContactInfo* contact = lookupContactByPubKey(pending_outbox[i].recipientPubKey, PUB_KEY_SIZE);
         unsigned long requiredDelay = (pending_outbox[i].retryCount > 0) ? NORMAL_SEND_RETRY_DELAY_MS : 100;
+        
+        // For multi-hop paths, ensure we wait at least the packet airtime since last send
+        if (contact && contact->out_path_len > 0) {
+          uint32_t airtimeMs = calcPacketAirtimeMs(MESHCORE_MAX_BINARY_PAYLOAD);
+          unsigned long timeSinceLastSend = _ms->getMillis() - last_wdp_send_time;
+          if (timeSinceLastSend < airtimeMs) {
+            // Not enough time has passed, skip this iteration
+            continue;
+          }
+        }
+        
+        // Ready to send (after delay from queue time)
         if (_ms->getMillis() - pending_outbox[i].time > requiredDelay) {
           if (!sendQueuedWDPMessage(&pending_outbox[i])) {
             // Send failed, schedule retry with longer delay
