@@ -340,12 +340,27 @@ protected:
     return false;
   }
 
+  // Only auto-add contacts whose name starts with "MAP-" - this prevents
+  // the contact list from filling up with unrelated nodes
+  bool isAutoAddEnabled() const override {
+    return false;
+  }
+
   void onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) override {
     Serial.printf("ADVERT from -> %s\n", contact.name);
     Serial.printf("  type: %s\n", getTypeName(contact.type));
     Serial.print("   public key: "); mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE); Serial.println();
 
-    saveContacts();
+    // Only add nodes whose name starts with "MAP-" to the contact list
+    if (is_new && strncmp(contact.name, "MAP-", 4) == 0) {
+      if (addContact(contact)) {
+        Serial.printf("   Added MAP- contact: %s\n", contact.name);
+        saveContacts();
+      }
+    } else if (!is_new) {
+      // Existing contact was updated (name/type/gps/timestamps)
+      saveContacts();
+    }
   }
 
   void onContactPathUpdated(const ContactInfo& contact) override {
